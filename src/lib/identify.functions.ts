@@ -11,6 +11,8 @@ export type IdentifiedSceneItem = {
   where: string;
   frameIndex: number;
   timestampMs: number;
+  /** Normalized crop box [x, y, width, height] in 0–1 image coordinates. */
+  box?: [number, number, number, number];
 };
 
 export type IdentifyResult =
@@ -35,13 +37,15 @@ const SKIP = new Set([
 const PROMPT = `You are reviewing an ordered sequence of still frames from a phone camera panning around a home. Build one inventory of distinct household objects a person would want to find later.
 
 Return ONLY JSON in this exact shape:
-{"items":[{"name":"short everyday object name","where":"brief description and location","frameIndex":0}]}
+{"items":[{"name":"short everyday object name","where":"brief description and location","frameIndex":0,"box":[0.12,0.25,0.28,0.35]}]}
 
 Rules:
 - Look carefully at EVERY frame. Objects often appear only in middle or later frames.
 - List up to 30 distinct, clearly visible physical objects (remotes, keys, phones, books, mugs, bags, chargers, shoes, pillows, plants, lamps, etc.).
 - frameIndex is zero-based and must be the clearest frame showing that object (integer from 0 to the last frame index).
 - List each object only once; pick its best frame.
+- box is the object's tight bounding box in that frame as [x, y, width, height], each a fraction from 0 to 1 of the image width/height (x = left edge, y = top edge).
+- Make box tight around the object with a small margin. Do not use the whole frame unless the object truly fills it.
 - Skip walls, floors, ceilings, windows, doors, people, pets, and empty open space.
 - Do not invent objects. Prefer specific names ("black TV remote") over vague ones ("object").
 - "where" should describe appearance and place, e.g. "black remote with gray buttons, on the coffee table".
@@ -58,6 +62,53 @@ function extractJson(text: string): unknown {
   return JSON.parse(raw.slice(start, end + 1));
 }
 
+function normalizeBox(raw: unknown): [number, number, number, number] | undefined {
+  if (!Array.isArray(raw) || raw.length < 4) return undefined;
+  const nums = raw.slice(0, 4).map((v) => Number(v));
+  if (!nums.every((n) => Number.isFinite(n))) return undefined;
+
+  // Accept 0–1 fractions or 0–1000 integer coords.
+  const scale = nums.some((n) => Math.abs(n) > 1.5) ? 1000 : 1;
+  const [a, b, c, d] = nums.map((n) => n / scale);
+
+  const candidates: Array<[number, number, number, number]> = [];
+
+  // [x, y, w, h]
+  candidates.push([a, b, c, d]);
+  // [x, y, x2, y2]
+  candidates.push([a, b, c - a, d - b]);
+  // [ymin, xmin, ymax, xmax] → [x, y, w, h]
+  candidates.push([b, a, d - b, c - a]);
+
+  const score = (box: [number, number, number, number]) => {
+    const [x, y, w, h] = box;
+    if (w <= 0.02 || h <= 0.02) return -1;
+    if (w > 1.05 || h > 1.05) return -1;
+    if (x < -0.05 || y < -0.05) return -1;
+    if (x + w > 1.1 || y + h > 1.1) return -1;
+    const area = Math.min(1, Math.max(0, w)) * Math.min(1, Math.max(0, h));
+    return 1 - area;
+  };
+
+  let best: [number, number, number, number] | null = null;
+  let bestScore = -1;
+  for (const cand of candidates) {
+    const s = score(cand);
+    if (s > bestScore) {
+      bestScore = s;
+      best = cand;
+    }
+  }
+  if (!best || bestScore < 0) return undefined;
+
+  let [x, y, w, h] = best;
+  x = Math.min(0.95, Math.max(0, x));
+  y = Math.min(0.95, Math.max(0, y));
+  w = Math.min(1 - x, Math.max(0.05, w));
+  h = Math.min(1 - y, Math.max(0.05, h));
+  return [x, y, w, h];
+}
+
 function parseItems(text: string, frames: SceneFrameInput[]): IdentifiedSceneItem[] {
   const parsed = extractJson(text) as { items?: unknown };
   if (!parsed || !Array.isArray(parsed.items)) return [];
@@ -68,7 +119,12 @@ function parseItems(text: string, frames: SceneFrameInput[]): IdentifiedSceneIte
 
   for (const raw of parsed.items) {
     if (!raw || typeof raw !== "object") continue;
-    const record = raw as { name?: unknown; where?: unknown; frameIndex?: unknown };
+    const record = raw as {
+      name?: unknown;
+      where?: unknown;
+      frameIndex?: unknown;
+      box?: unknown;
+    };
     const name = cleanLabel(record.name, 60);
     const where = cleanLabel(record.where, 160) || "Somewhere in view";
     const key = normName(name);
@@ -78,12 +134,15 @@ function parseItems(text: string, frames: SceneFrameInput[]): IdentifiedSceneIte
     if (!Number.isFinite(frameIndex)) frameIndex = 0;
     frameIndex = Math.max(0, Math.min(lastFrame, Math.round(frameIndex)));
 
+    const box = normalizeBox(record.box);
+
     seen.add(key);
     out.push({
       name,
       where,
       frameIndex,
       timestampMs: frames[frameIndex].timestampMs,
+      box,
     });
     if (out.length >= 30) break;
   }
@@ -98,7 +157,6 @@ export const identifyScene = createServerFn({ method: "POST" })
       throw new Error("The recording frames are missing or invalid. Please record again.");
     }
 
-    // Evenly subsample if the client sent more frames than we allow.
     if (frames.length > MAX_FRAMES) {
       const picked: typeof frames = [];
       for (let i = 0; i < MAX_FRAMES; i += 1) {
@@ -210,7 +268,6 @@ export const identifyScene = createServerFn({ method: "POST" })
       return { ok: true, text };
     };
 
-    // Frame sets to try: full set, then lighter subsets if Gemini is overloaded.
     const frameSets: Array<typeof data.frames> = [data.frames];
     if (data.frames.length > 4) {
       const light: typeof data.frames = [];
@@ -230,7 +287,6 @@ export const identifyScene = createServerFn({ method: "POST" })
 
       for (const frames of frameSets) {
         for (const model of MODEL_CANDIDATES) {
-          // Retry transient overload (503) and rate limits (429).
           for (let attempt = 0; attempt < 3; attempt += 1) {
             if (attempt > 0) {
               await sleep(800 * attempt * attempt);
@@ -272,10 +328,7 @@ export const identifyScene = createServerFn({ method: "POST" })
             if (result.status === 401 || result.status === 403) {
               return { ok: false, error: "Gemini couldn't authorize the request. Check the API key configuration." };
             }
-            if (result.status === 400) {
-              break;
-            }
-            if (result.status === 404) {
+            if (result.status === 400 || result.status === 404) {
               break;
             }
             if (result.status === 429 || result.status === 503) {
