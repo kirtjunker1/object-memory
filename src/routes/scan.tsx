@@ -216,6 +216,14 @@ function ScanPage() {
       setPhase("processing");
       setBusy(true);
       setBanner("Finishing your recording…");
+      // Flush any buffered data before stop so short clips are not empty.
+      try {
+        if (typeof recorder.requestData === "function") {
+          recorder.requestData();
+        }
+      } catch {
+        // requestData can throw if the recorder is already finishing.
+      }
       recorder.stop();
     }
   }
@@ -292,7 +300,9 @@ function ScanPage() {
         void analyzeRecording(recording, startedAt);
       };
 
-      recorder.start(1000);
+      // Smaller timeslice so short recordings still produce usable chunks
+      // when the user stops before the first full second.
+      recorder.start(250);
       noteLook();
       setRecordingMs(0);
       setBanner("Recording. Slowly move around the room so objects are clear.");
@@ -697,3 +707,4 @@ function ScanPage() {
     </div>
   );
 }
+
