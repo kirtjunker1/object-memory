@@ -93,9 +93,19 @@ function parseItems(text: string, frames: SceneFrameInput[]): IdentifiedSceneIte
 
 export const identifyScene = createServerFn({ method: "POST" })
   .validator((input: { frames?: SceneFrameInput[]; roomName?: string }) => {
-    const frames = input?.frames;
-    if (!Array.isArray(frames) || frames.length === 0 || frames.length > MAX_FRAMES) {
+    let frames = input?.frames;
+    if (!Array.isArray(frames) || frames.length === 0) {
       throw new Error("The recording frames are missing or invalid. Please record again.");
+    }
+
+    // Evenly subsample if the client sent more frames than we allow.
+    if (frames.length > MAX_FRAMES) {
+      const picked: typeof frames = [];
+      for (let i = 0; i < MAX_FRAMES; i += 1) {
+        const idx = Math.round((i * (frames.length - 1)) / (MAX_FRAMES - 1));
+        picked.push(frames[idx]);
+      }
+      frames = picked;
     }
 
     let totalSize = 0;
