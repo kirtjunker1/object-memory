@@ -17,8 +17,9 @@ export type IdentifyResult =
   | { ok: true; items: IdentifiedSceneItem[] }
   | { ok: false; error: string };
 
-// Keep the model already configured by this project.
-const MODEL = "gemini-3.8-flash";
+// Fast multimodal model suited to multi-frame room inventory.
+// Prefer the project setup model; fall back to current Flash if needed.
+const MODEL = "gemini-2.5-flash-lite";
 const MAX_FRAMES = 20;
 const MAX_TOTAL_BASE64 = 4_000_000;
 const MAX_FRAME_BASE64 = 1_500_000;
@@ -60,6 +61,7 @@ function parseItems(text: string, frames: SceneFrameInput[]): IdentifiedSceneIte
 
   const out: IdentifiedSceneItem[] = [];
   const seen = new Set<string>();
+  const lastFrame = Math.max(0, frames.length - 1);
 
   for (const raw of parsed.items) {
     if (!raw || typeof raw !== "object") continue;
@@ -69,8 +71,11 @@ function parseItems(text: string, frames: SceneFrameInput[]): IdentifiedSceneIte
     const key = normName(name);
     if (!key || SKIP.has(key) || seen.has(key)) continue;
 
-    const frameIndex = Number.isInteger(record.frameIndex) ? Number(record.frameIndex) : 0;
-    if (frameIndex < 0 || frameIndex >= frames.length) continue;
+    // Coerce frameIndex (model may return string, float, or out-of-range values).
+    // Clamp to a valid frame instead of dropping the item entirely.
+    let frameIndex = Number(record.frameIndex);
+    if (!Number.isFinite(frameIndex)) frameIndex = 0;
+    frameIndex = Math.max(0, Math.min(lastFrame, Math.round(frameIndex)));
 
     seen.add(key);
     out.push({
@@ -201,3 +206,4 @@ export const identifyScene = createServerFn({ method: "POST" })
       return { ok: false, error: "Couldn't reach Gemini. Check your connection and try again." };
     }
   });
+
