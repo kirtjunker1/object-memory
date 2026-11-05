@@ -23,7 +23,7 @@ const MODEL_CANDIDATES = [
   "gemini-3.8-flash",
   "gemini-2.5-flash-lite",
 ] as const;
-const MAX_FRAMES = 12;
+const MAX_FRAMES = 8;
 const MAX_TOTAL_BASE64 = 3_000_000;
 const MAX_FRAME_BASE64 = 900_000;
 
@@ -146,99 +146,165 @@ export const identifyScene = createServerFn({ method: "POST" })
       return { ok: false, error: "Vision isn't configured yet. Please try again later." };
     }
 
-    const prompt = `${PROMPT}\nThe room is: ${data.roomName}. There are ${data.frames.length} frames, numbered from 0 to ${data.frames.length - 1}.`;
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    const parts: Array<
-      { inline_data: { mime_type: string; data: string } } | { text: string }
-    > = [];
-
-    data.frames.forEach((frame, index) => {
-      const raw = frame.imageBase64.includes(",")
-        ? frame.imageBase64.slice(frame.imageBase64.indexOf(",") + 1)
-        : frame.imageBase64;
-      parts.push({
-        inline_data: {
-          mime_type: "image/jpeg",
-          data: raw,
-        },
+    const buildParts = (frames: typeof data.frames) => {
+      const next: Array<
+        { inline_data: { mime_type: string; data: string } } | { text: string }
+      > = [];
+      frames.forEach((frame, index) => {
+        const raw = frame.imageBase64.includes(",")
+          ? frame.imageBase64.slice(frame.imageBase64.indexOf(",") + 1)
+          : frame.imageBase64;
+        next.push({
+          inline_data: {
+            mime_type: "image/jpeg",
+            data: raw,
+          },
+        });
+        next.push({ text: `Frame index ${index}.` });
       });
-      parts.push({ text: `Frame index ${index}.` });
-    });
-    parts.push({ text: prompt });
+      next.push({
+        text: `${PROMPT}\nThe room is: ${data.roomName}. There are ${frames.length} frames, numbered from 0 to ${frames.length - 1}.`,
+      });
+      return next;
+    };
 
-    const requestBody = JSON.stringify({
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        maxOutputTokens: 4096,
-      },
-    });
+    const callGemini = async (
+      model: string,
+      frames: typeof data.frames,
+    ): Promise<{ ok: true; text: string } | { ok: false; status: number; body: string }> => {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: buildParts(frames) }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            maxOutputTokens: 4096,
+          },
+        }),
+        signal: AbortSignal.timeout(90_000),
+      });
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        return { ok: false, status: response.status, body };
+      }
+
+      const payload = await response.json() as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      };
+      const text = payload.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text ?? "")
+        .join("\n")
+        .trim();
+
+      if (!text) {
+        return { ok: false, status: 200, body: "empty candidates" };
+      }
+      return { ok: true, text };
+    };
+
+    // Frame sets to try: full set, then lighter subsets if Gemini is overloaded.
+    const frameSets: Array<typeof data.frames> = [data.frames];
+    if (data.frames.length > 4) {
+      const light: typeof data.frames = [];
+      for (let i = 0; i < 4; i += 1) {
+        const idx = Math.round((i * (data.frames.length - 1)) / 3);
+        light.push(data.frames[idx]);
+      }
+      frameSets.push(light);
+    }
+    if (data.frames.length > 1) {
+      frameSets.push([data.frames[Math.floor(data.frames.length / 2)]]);
+    }
 
     try {
       let lastStatus = 0;
       let lastBody = "";
 
-      for (const model of MODEL_CANDIDATES) {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-        const response = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": apiKey,
-          },
-          body: requestBody,
-          signal: AbortSignal.timeout(90_000),
-        });
+      for (const frames of frameSets) {
+        for (const model of MODEL_CANDIDATES) {
+          // Retry transient overload (503) and rate limits (429).
+          for (let attempt = 0; attempt < 3; attempt += 1) {
+            if (attempt > 0) {
+              await sleep(800 * attempt * attempt);
+            }
 
-        lastStatus = response.status;
-        if (!response.ok) {
-          lastBody = await response.text().catch(() => "");
-          console.error("Gemini identification failed", model, response.status, lastBody.slice(0, 300));
-          if (response.status === 404) continue;
-          if (response.status === 401 || response.status === 403) {
-            return { ok: false, error: "Gemini couldn't authorize the request. Check the API key configuration." };
+            let result: Awaited<ReturnType<typeof callGemini>>;
+            try {
+              result = await callGemini(model, frames);
+            } catch (error) {
+              console.error(
+                "Gemini request threw",
+                model,
+                error instanceof Error ? error.message : "unknown",
+              );
+              lastStatus = 0;
+              lastBody = error instanceof Error ? error.message : "network error";
+              continue;
+            }
+
+            if (result.ok) {
+              try {
+                return { ok: true, items: parseItems(result.text, frames) };
+              } catch {
+                return { ok: false, error: "Couldn't read the objects Gemini identified. Please try again." };
+              }
+            }
+
+            lastStatus = result.status;
+            lastBody = result.body;
+            console.error(
+              "Gemini identification failed",
+              model,
+              result.status,
+              `frames=${frames.length}`,
+              `attempt=${attempt + 1}`,
+              result.body.slice(0, 300),
+            );
+
+            if (result.status === 401 || result.status === 403) {
+              return { ok: false, error: "Gemini couldn't authorize the request. Check the API key configuration." };
+            }
+            if (result.status === 400) {
+              break;
+            }
+            if (result.status === 404) {
+              break;
+            }
+            if (result.status === 429 || result.status === 503) {
+              continue;
+            }
+            break;
           }
-          if (response.status === 429) {
-            return { ok: false, error: "Gemini's request limit was reached. Please wait a little and try again." };
-          }
-          if (response.status === 400) {
-            return {
-              ok: false,
-              error: "Gemini rejected this recording (payload or format). Try a shorter Look of 5–10 seconds.",
-            };
-          }
-          return {
-            ok: false,
-            error: `Couldn't analyze this recording (Gemini ${response.status}). You can name the frames yourself.`,
-          };
-        }
-
-        const body = await response.json() as {
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-        };
-        const text = body.candidates?.[0]?.content?.parts
-          ?.map((part) => part.text ?? "")
-          .join("\n")
-          .trim();
-
-        if (!text) {
-          return { ok: false, error: "Gemini returned no object list. Please try another recording." };
-        }
-
-        try {
-          return { ok: true, items: parseItems(text, data.frames) };
-        } catch {
-          return { ok: false, error: "Couldn't read the objects Gemini identified. Please try again." };
         }
       }
 
-      console.error("All Gemini models failed", lastStatus, lastBody.slice(0, 300));
+      console.error("All Gemini attempts failed", lastStatus, lastBody.slice(0, 300));
+      if (lastStatus === 503) {
+        return {
+          ok: false,
+          error: "Gemini is temporarily overloaded (503). Wait a minute and try a shorter Look, or name the frames yourself.",
+        };
+      }
+      if (lastStatus === 429) {
+        return { ok: false, error: "Gemini's request limit was reached. Please wait a little and try again." };
+      }
+      if (lastStatus === 404) {
+        return {
+          ok: false,
+          error: "No available Gemini vision model for this API key. Check the key and model access in Google AI Studio.",
+        };
+      }
       return {
         ok: false,
-        error:
-          lastStatus === 404
-            ? "No available Gemini vision model for this API key. Check the key and model access in Google AI Studio."
-            : `Couldn't analyze this recording (Gemini ${lastStatus || "error"}). You can name the frames yourself.`,
+        error: `Couldn't analyze this recording (Gemini ${lastStatus || "error"}). You can name the frames yourself.`,
       };
     } catch (error) {
       console.error(
