@@ -1,24 +1,30 @@
-# Object Memory — Gemini setup
+# Object Memory — Vision setup
 
-This project sends room photos to Google Gemini from its server function. The API key is read only on the server from `GEMINI_API_KEY`; it is not placed in browser code.
+This project sends room photos to a vision model from its server function. Keys are read only on the server; they are never placed in browser code.
 
-## Configure the key in Vercel
+## Gemini (primary)
 
-1. Open your Vercel dashboard and select the Object Memory project.
+1. Open your host dashboard (e.g. Vercel) and select the Object Memory project.
 2. Open **Settings → Environment Variables**.
-3. Add a variable named `GEMINI_API_KEY`.
-4. Paste your Gemini API key as the value. Do not add quotation marks or a `VITE_` prefix.
-5. Select the environments you use (at least **Production**; also Preview if you deploy previews), then save.
-6. Redeploy the latest deployment so the server receives the new variable.
+3. Add `GEMINI_API_KEY` with your Gemini API key (no quotes, no `VITE_` prefix).
+4. Select Production (and Preview if you use it), save, then redeploy.
 
-Never commit the API key to GitHub, put it in an HTML file, or send it in chat.
+Get a key: https://aistudio.google.com/app/apikey
 
-## Gemini model
+## OpenRouter (free fallback)
 
-Object identification uses `gemini-2.5-flash-lite` with image input and JSON output. Google's free tier has usage limits and may change. Check current pricing and limits before relying on it for heavy usage:
-https://ai.google.dev/gemini-api/docs/pricing
+When Gemini is overloaded (503) or rate-limited (429), the app automatically tries free vision models on OpenRouter.
 
-Google AI Studio API keys:
-https://aistudio.google.com/app/apikey
+1. Create a free account at https://openrouter.ai
+2. Create an API key at https://openrouter.ai/keys
+3. Add environment variable `OPENROUTER_API_KEY` with that key.
+4. Redeploy so the server receives it.
 
-Keep the key restricted to the Gemini API where Google's key-management options allow it. If a newly created key is an authorization key, follow the current AI Studio instructions for using it with the Gemini API.
+Free OpenRouter models are rate-limited (about 50 requests/day without purchased credits, higher after a small one-time credit purchase). See OpenRouter docs for current limits.
+
+## Models used
+
+- **Gemini (first):** `gemini-3.5-flash-lite`, then `gemini-3.8-flash`, then `gemini-2.5-flash-lite`
+- **OpenRouter (fallback):** `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3.5-super-vl:free`
+
+Never commit API keys to GitHub or put them in client code.
