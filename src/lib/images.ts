@@ -138,6 +138,53 @@ export async function blobToBase64(blob: Blob): Promise<string> {
   return btoa(binary);
 }
 
+/**
+ * Crop a JPEG to a normalized [x, y, width, height] box (0–1).
+ * Adds a little padding so the object is not clipped too tightly.
+ */
+export async function cropJpeg(
+  photo: Blob,
+  box: [number, number, number, number],
+  padding = 0.08,
+): Promise<Blob> {
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(photo);
+  } catch {
+    return photo;
+  }
+
+  try {
+    const [bx, by, bw, bh] = box;
+    const padX = bw * padding;
+    const padY = bh * padding;
+    let x = (bx - padX) * bitmap.width;
+    let y = (by - padY) * bitmap.height;
+    let w = (bw + padX * 2) * bitmap.width;
+    let h = (bh + padY * 2) * bitmap.height;
+
+    x = Math.max(0, Math.floor(x));
+    y = Math.max(0, Math.floor(y));
+    w = Math.min(bitmap.width - x, Math.ceil(w));
+    h = Math.min(bitmap.height - y, Math.ceil(h));
+
+    if (w < 16 || h < 16) {
+      return photo;
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) return photo;
+
+    context.drawImage(bitmap, x, y, w, h, 0, 0, w, h);
+    return canvasToJpeg(canvas, PHOTO_QUALITY);
+  } finally {
+    bitmap.close();
+  }
+}
+
 export type ExtractedVideoFrame = {
   /** Reduced image sent to Gemini for analysis. */
   imageBase64: string;
@@ -149,9 +196,6 @@ export type ExtractedVideoFrame = {
   timestampMs: number;
 };
 
-/**
- * Wait for a media event, with a timeout so extraction cannot hang forever.
- */
 function waitForMediaEvent(
   video: HTMLVideoElement,
   eventName: string,
@@ -190,17 +234,9 @@ function waitForMediaEvent(
   });
 }
 
-/**
- * Recover a usable duration from a recording.
- *
- * Chromium-based browsers can report Infinity for WebM recordings created
- * with MediaRecorder. Seeking toward the end can force the browser to
- * discover and report the recording's actual duration.
- */
 async function getVideoDuration(
   video: HTMLVideoElement,
 ): Promise<number> {
-  // First, try the normal duration value.
   if (
     Number.isFinite(video.duration) &&
     video.duration > 0
@@ -208,7 +244,6 @@ async function getVideoDuration(
     return video.duration;
   }
 
-  // Some browsers expose a usable end time through seekable ranges.
   const getSeekableEnd = (): number => {
     try {
       if (video.seekable.length > 0) {
@@ -219,7 +254,7 @@ async function getVideoDuration(
         }
       }
     } catch {
-      // The browser may not have populated seekable ranges yet.
+      // ignore
     }
 
     return 0;
@@ -231,8 +266,6 @@ async function getVideoDuration(
     return duration;
   }
 
-  // Chromium WebM duration recovery:
-  // Seeking to a very large time can make the browser discover the end.
   try {
     const seeked = waitForMediaEvent(video, "seeked", 7000);
 
@@ -240,7 +273,7 @@ async function getVideoDuration(
 
     await seeked;
   } catch {
-    // Continue to check duration and seekable ranges.
+    // continue
   }
 
   if (
@@ -258,8 +291,6 @@ async function getVideoDuration(
     );
   }
 
-  // Reset to the start so later frame seeks are reliable after the
-  // Infinity-recovery seek left the playhead at the end.
   try {
     if (video.currentTime > 0.05) {
       const seeked = waitForMediaEvent(video, "seeked", 5000);
@@ -267,15 +298,12 @@ async function getVideoDuration(
       await seeked;
     }
   } catch {
-    // Frame extraction will still attempt individual seeks.
+    // ignore
   }
 
   return duration;
 }
 
-/**
- * Extract up to 12 ordered stills, spread across the recording.
- */
 export async function extractFramesFromVideo(
   recording: Blob,
   maxFrames = MAX_ANALYSIS_FRAMES,
@@ -293,7 +321,6 @@ export async function extractFramesFromVideo(
   video.playsInline = true;
 
   try {
-    // Wait until the browser has loaded the recording metadata.
     const metadata = waitForMediaEvent(
       video,
       "loadedmetadata",
@@ -305,14 +332,12 @@ export async function extractFramesFromVideo(
 
     await metadata;
 
-    // Check video dimensions separately from duration.
     if (!video.videoWidth || !video.videoHeight) {
       throw new Error(
         "The recording didn't contain readable video. Please try again.",
       );
     }
 
-    // Recover the duration even if the browser initially reports Infinity.
     const actualDuration = await getVideoDuration(video);
 
     const duration = Math.min(actualDuration, 60);
@@ -323,8 +348,6 @@ export async function extractFramesFromVideo(
       );
     }
 
-    // Sample more densely on short clips so stopping early still yields
-    // enough frames for object identification.
     const count = Math.max(
       1,
       Math.min(
@@ -336,8 +359,6 @@ export async function extractFramesFromVideo(
       ),
     );
 
-    // Avoid the absolute start/end of MediaRecorder WebM where keyframes
-    // are sometimes missing or black.
     const firstTime = Math.min(0.15, Math.max(0, duration * 0.05));
     const lastTime = Math.max(
       firstTime,
@@ -353,7 +374,6 @@ export async function extractFramesFromVideo(
       const time =
         firstTime + (lastTime - firstTime) * progress;
 
-      // Move to the requested timestamp.
       if (Math.abs(video.currentTime - time) > 0.01) {
         const seeked = waitForMediaEvent(
           video,
@@ -366,19 +386,16 @@ export async function extractFramesFromVideo(
         await seeked;
       }
 
-      // Brief settle so the decoded frame is painted before capture.
       await new Promise((resolve) => {
         requestAnimationFrame(() => resolve(undefined));
       });
 
-      // Capture the high-quality photograph.
       const photoBlob = await drawToJpeg(
         video,
         PHOTO_MAX_EDGE,
         PHOTO_QUALITY,
       );
 
-      // Create the smaller image for Gemini.
       const analysisBlob = await drawToJpeg(
         video,
         ANALYSIS_MAX_EDGE,
