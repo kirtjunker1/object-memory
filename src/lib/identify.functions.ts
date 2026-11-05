@@ -29,21 +29,21 @@ const SKIP = new Set([
   "picture", "photo", "image", "person", "people",
 ]);
 
-const PROMPT = `You are reviewing an ordered sequence of still frames sampled from one continuous home video. Build one inventory of distinct, useful household objects visible anywhere in the sequence.
+const PROMPT = `You are reviewing an ordered sequence of still frames from a phone camera panning around a home. Build one inventory of distinct household objects a person would want to find later.
+
 Return ONLY JSON in this exact shape:
-{"items":[{"name":"short everyday object name","where":"useful location relative to furniture","frameIndex":0}]}
+{"items":[{"name":"short everyday object name","where":"brief description and location","frameIndex":0}]}
+
 Rules:
-- Identify up to 30 distinct, clearly visible physical objects that a person might want to find later.
-- Review ALL frames, not just the first or last frame.
-- The frame index is zero-based and must identify the clearest frame in which that object is visible.
-- If an object appears in several frames or from several angles, list it only once and choose its clearest frame.
-- Do not list the same object twice under slightly different names.
-- Skip walls, floors, ceilings, windows, doors, people, pets, and general room features.
-- Do not guess or invent objects. Only include objects clearly visible in at least one frame.
-- Prefer specific names ("black TV remote") over vague words ("object").
-- "where" should give a short useful description of the object's visible appearance AND where it was found, such as "black remote with gray buttons, on the coffee table". If it moves during the clip, use the clearest/latest useful location.
+- Look carefully at EVERY frame. Objects often appear only in middle or later frames.
+- List up to 30 distinct, clearly visible physical objects (remotes, keys, phones, books, mugs, bags, chargers, shoes, pillows, plants, lamps, etc.).
+- frameIndex is zero-based and must be the clearest frame showing that object (integer from 0 to the last frame index).
+- List each object only once; pick its best frame.
+- Skip walls, floors, ceilings, windows, doors, people, pets, and empty open space.
+- Do not invent objects. Prefer specific names ("black TV remote") over vague ones ("object").
+- "where" should describe appearance and place, e.g. "black remote with gray buttons, on the coffee table".
 - Do not repeat the room name in "where".
-- If no useful objects are visible, return {"items":[]}.
+- If nothing useful is visible, return {"items":[]}.
 `;
 
 function extractJson(text: string): unknown {
@@ -206,4 +206,3 @@ export const identifyScene = createServerFn({ method: "POST" })
       return { ok: false, error: "Couldn't reach Gemini. Check your connection and try again." };
     }
   });
-
