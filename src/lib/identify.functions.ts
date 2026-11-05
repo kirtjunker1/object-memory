@@ -19,12 +19,20 @@ export type IdentifyResult =
   | { ok: true; items: IdentifiedSceneItem[] }
   | { ok: false; error: string };
 
-// Current multimodal Flash models (2.5 is limited to existing users).
-const MODEL_CANDIDATES = [
+// Gemini models (tried first).
+const GEMINI_MODELS = [
   "gemini-3.5-flash-lite",
   "gemini-3.8-flash",
   "gemini-2.5-flash-lite",
 ] as const;
+
+// OpenRouter free vision models (fallback when Gemini is down/overloaded).
+const OPENROUTER_MODELS = [
+  "google/gemma-4-31b-it:free",
+  "google/gemma-4-26b-a4b-it:free",
+  "nvidia/nemotron-3.5-super-vl:free",
+] as const;
+
 const MAX_FRAMES = 8;
 const MAX_TOTAL_BASE64 = 3_000_000;
 const MAX_FRAME_BASE64 = 900_000;
@@ -67,18 +75,14 @@ function normalizeBox(raw: unknown): [number, number, number, number] | undefine
   const nums = raw.slice(0, 4).map((v) => Number(v));
   if (!nums.every((n) => Number.isFinite(n))) return undefined;
 
-  // Accept 0–1 fractions or 0–1000 integer coords.
   const scale = nums.some((n) => Math.abs(n) > 1.5) ? 1000 : 1;
   const [a, b, c, d] = nums.map((n) => n / scale);
 
-  const candidates: Array<[number, number, number, number]> = [];
-
-  // [x, y, w, h]
-  candidates.push([a, b, c, d]);
-  // [x, y, x2, y2]
-  candidates.push([a, b, c - a, d - b]);
-  // [ymin, xmin, ymax, xmax] → [x, y, w, h]
-  candidates.push([b, a, d - b, c - a]);
+  const candidates: Array<[number, number, number, number]> = [
+    [a, b, c, d],
+    [a, b, c - a, d - b],
+    [b, a, d - b, c - a],
+  ];
 
   const score = (box: [number, number, number, number]) => {
     const [x, y, w, h] = box;
@@ -150,6 +154,144 @@ function parseItems(text: string, frames: SceneFrameInput[]): IdentifiedSceneIte
   return out;
 }
 
+function stripDataUrl(base64: string): string {
+  return base64.includes(",")
+    ? base64.slice(base64.indexOf(",") + 1)
+    : base64;
+}
+
+function buildPrompt(roomName: string, frameCount: number): string {
+  return `${PROMPT}\nThe room is: ${roomName}. There are ${frameCount} frames, numbered from 0 to ${frameCount - 1}.`;
+}
+
+type ProviderOk = { ok: true; text: string };
+type ProviderFail = { ok: false; status: number; body: string };
+type ProviderResult = ProviderOk | ProviderFail;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function callGemini(
+  apiKey: string,
+  model: string,
+  frames: SceneFrameInput[],
+  roomName: string,
+): Promise<ProviderResult> {
+  const parts: Array<
+    { inline_data: { mime_type: string; data: string } } | { text: string }
+  > = [];
+
+  frames.forEach((frame, index) => {
+    parts.push({
+      inline_data: {
+        mime_type: "image/jpeg",
+        data: stripDataUrl(frame.imageBase64),
+      },
+    });
+    parts.push({ text: `Frame index ${index}.` });
+  });
+  parts.push({ text: buildPrompt(roomName, frames.length) });
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        maxOutputTokens: 4096,
+      },
+    }),
+    signal: AbortSignal.timeout(90_000),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    return { ok: false, status: response.status, body };
+  }
+
+  const payload = await response.json() as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+  const text = payload.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text ?? "")
+    .join("\n")
+    .trim();
+
+  if (!text) return { ok: false, status: 200, body: "empty candidates" };
+  return { ok: true, text };
+}
+
+async function callOpenRouter(
+  apiKey: string,
+  model: string,
+  frames: SceneFrameInput[],
+  roomName: string,
+): Promise<ProviderResult> {
+  const content: Array<
+    { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }
+  > = [];
+
+  frames.forEach((frame, index) => {
+    content.push({
+      type: "image_url",
+      image_url: {
+        url: `data:image/jpeg;base64,${stripDataUrl(frame.imageBase64)}`,
+      },
+    });
+    content.push({ type: "text", text: `Frame index ${index}.` });
+  });
+  content.push({ type: "text", text: buildPrompt(roomName, frames.length) });
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "HTTP-Referer": "https://nook.app",
+      "X-Title": "Nook object memory",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content }],
+      max_tokens: 4096,
+      temperature: 0.2,
+    }),
+    signal: AbortSignal.timeout(90_000),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    return { ok: false, status: response.status, body };
+  }
+
+  const payload = await response.json() as {
+    choices?: Array<{ message?: { content?: string | null } }>;
+  };
+  const text = payload.choices?.[0]?.message?.content?.trim() ?? "";
+  if (!text) return { ok: false, status: 200, body: "empty choices" };
+  return { ok: true, text };
+}
+
+function frameSetsFor(frames: SceneFrameInput[]): SceneFrameInput[][] {
+  const sets: SceneFrameInput[][] = [frames];
+  if (frames.length > 4) {
+    const light: SceneFrameInput[] = [];
+    for (let i = 0; i < 4; i += 1) {
+      const idx = Math.round((i * (frames.length - 1)) / 3);
+      light.push(frames[idx]);
+    }
+    sets.push(light);
+  }
+  if (frames.length > 1) {
+    sets.push([frames[Math.floor(frames.length / 2)]]);
+  }
+  return sets;
+}
+
 export const identifyScene = createServerFn({ method: "POST" })
   .validator((input: { frames?: SceneFrameInput[]; roomName?: string }) => {
     let frames = input?.frames;
@@ -199,171 +341,142 @@ export const identifyScene = createServerFn({ method: "POST" })
     return { frames: safeFrames, roomName };
   })
   .handler(async ({ data }): Promise<IdentifyResult> => {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return { ok: false, error: "Vision isn't configured yet. Please try again later." };
-    }
+    const geminiKey = process.env.GEMINI_API_KEY?.trim();
+    const openRouterKey = process.env.OPENROUTER_API_KEY?.trim();
 
-    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-    const buildParts = (frames: typeof data.frames) => {
-      const next: Array<
-        { inline_data: { mime_type: string; data: string } } | { text: string }
-      > = [];
-      frames.forEach((frame, index) => {
-        const raw = frame.imageBase64.includes(",")
-          ? frame.imageBase64.slice(frame.imageBase64.indexOf(",") + 1)
-          : frame.imageBase64;
-        next.push({
-          inline_data: {
-            mime_type: "image/jpeg",
-            data: raw,
-          },
-        });
-        next.push({ text: `Frame index ${index}.` });
-      });
-      next.push({
-        text: `${PROMPT}\nThe room is: ${data.roomName}. There are ${frames.length} frames, numbered from 0 to ${frames.length - 1}.`,
-      });
-      return next;
-    };
-
-    const callGemini = async (
-      model: string,
-      frames: typeof data.frames,
-    ): Promise<{ ok: true; text: string } | { ok: false; status: number; body: string }> => {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: buildParts(frames) }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            maxOutputTokens: 4096,
-          },
-        }),
-        signal: AbortSignal.timeout(90_000),
-      });
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        return { ok: false, status: response.status, body };
-      }
-
-      const payload = await response.json() as {
-        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    if (!geminiKey && !openRouterKey) {
+      return {
+        ok: false,
+        error: "Vision isn't configured yet. Set GEMINI_API_KEY and/or OPENROUTER_API_KEY.",
       };
-      const text = payload.candidates?.[0]?.content?.parts
-        ?.map((part) => part.text ?? "")
-        .join("\n")
-        .trim();
+    }
 
-      if (!text) {
-        return { ok: false, status: 200, body: "empty candidates" };
+    const sets = frameSetsFor(data.frames);
+    let lastStatus = 0;
+    let lastBody = "";
+    let triedAny = false;
+
+    const tryParse = (text: string, frames: SceneFrameInput[]): IdentifyResult => {
+      try {
+        return { ok: true, items: parseItems(text, frames) };
+      } catch {
+        return { ok: false, error: "Couldn't read the objects the AI identified. Please try again." };
       }
-      return { ok: true, text };
     };
 
-    const frameSets: Array<typeof data.frames> = [data.frames];
-    if (data.frames.length > 4) {
-      const light: typeof data.frames = [];
-      for (let i = 0; i < 4; i += 1) {
-        const idx = Math.round((i * (data.frames.length - 1)) / 3);
-        light.push(data.frames[idx]);
-      }
-      frameSets.push(light);
-    }
-    if (data.frames.length > 1) {
-      frameSets.push([data.frames[Math.floor(data.frames.length / 2)]]);
-    }
-
-    try {
-      let lastStatus = 0;
-      let lastBody = "";
-
-      for (const frames of frameSets) {
-        for (const model of MODEL_CANDIDATES) {
+    // 1) Gemini first
+    if (geminiKey) {
+      for (const frames of sets) {
+        for (const model of GEMINI_MODELS) {
           for (let attempt = 0; attempt < 3; attempt += 1) {
-            if (attempt > 0) {
-              await sleep(800 * attempt * attempt);
-            }
+            if (attempt > 0) await sleep(800 * attempt * attempt);
+            triedAny = true;
 
-            let result: Awaited<ReturnType<typeof callGemini>>;
+            let result: ProviderResult;
             try {
-              result = await callGemini(model, frames);
+              result = await callGemini(geminiKey, model, frames, data.roomName);
             } catch (error) {
-              console.error(
-                "Gemini request threw",
-                model,
-                error instanceof Error ? error.message : "unknown",
-              );
+              console.error("Gemini threw", model, error instanceof Error ? error.message : "unknown");
               lastStatus = 0;
               lastBody = error instanceof Error ? error.message : "network error";
               continue;
             }
 
-            if (result.ok) {
-              try {
-                return { ok: true, items: parseItems(result.text, frames) };
-              } catch {
-                return { ok: false, error: "Couldn't read the objects Gemini identified. Please try again." };
-              }
-            }
+            if (result.ok) return tryParse(result.text, frames);
 
             lastStatus = result.status;
             lastBody = result.body;
             console.error(
-              "Gemini identification failed",
+              "Gemini failed",
               model,
               result.status,
               `frames=${frames.length}`,
               `attempt=${attempt + 1}`,
-              result.body.slice(0, 300),
+              result.body.slice(0, 200),
             );
 
-            if (result.status === 401 || result.status === 403) {
-              return { ok: false, error: "Gemini couldn't authorize the request. Check the API key configuration." };
-            }
-            if (result.status === 400 || result.status === 404) {
-              break;
-            }
-            if (result.status === 429 || result.status === 503) {
-              continue;
-            }
+            if (result.status === 401 || result.status === 403) break;
+            if (result.status === 400 || result.status === 404) break;
+            if (result.status === 429 || result.status === 503) continue;
             break;
           }
         }
       }
+    }
 
-      console.error("All Gemini attempts failed", lastStatus, lastBody.slice(0, 300));
-      if (lastStatus === 503) {
-        return {
-          ok: false,
-          error: "Gemini is temporarily overloaded (503). Wait a minute and try a shorter Look, or name the frames yourself.",
-        };
+    // 2) OpenRouter free vision models as fallback
+    if (openRouterKey) {
+      console.error("Falling back to OpenRouter after Gemini issues", lastStatus);
+      for (const frames of sets) {
+        for (const model of OPENROUTER_MODELS) {
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            if (attempt > 0) await sleep(1000 * attempt);
+            triedAny = true;
+
+            let result: ProviderResult;
+            try {
+              result = await callOpenRouter(openRouterKey, model, frames, data.roomName);
+            } catch (error) {
+              console.error("OpenRouter threw", model, error instanceof Error ? error.message : "unknown");
+              lastStatus = 0;
+              lastBody = error instanceof Error ? error.message : "network error";
+              continue;
+            }
+
+            if (result.ok) return tryParse(result.text, frames);
+
+            lastStatus = result.status;
+            lastBody = result.body;
+            console.error(
+              "OpenRouter failed",
+              model,
+              result.status,
+              `frames=${frames.length}`,
+              `attempt=${attempt + 1}`,
+              result.body.slice(0, 200),
+            );
+
+            if (result.status === 401 || result.status === 403) {
+              return {
+                ok: false,
+                error: "OpenRouter couldn't authorize the request. Check OPENROUTER_API_KEY.",
+              };
+            }
+            if (result.status === 429) continue;
+            if (result.status === 404) break;
+            break;
+          }
+        }
       }
-      if (lastStatus === 429) {
-        return { ok: false, error: "Gemini's request limit was reached. Please wait a little and try again." };
-      }
-      if (lastStatus === 404) {
-        return {
-          ok: false,
-          error: "No available Gemini vision model for this API key. Check the key and model access in Google AI Studio.",
-        };
-      }
+    }
+
+    if (!triedAny) {
+      return { ok: false, error: "Vision isn't configured yet. Please try again later." };
+    }
+
+    console.error("All vision providers failed", lastStatus, lastBody.slice(0, 300));
+
+    if (lastStatus === 503) {
       return {
         ok: false,
-        error: `Couldn't analyze this recording (Gemini ${lastStatus || "error"}). You can name the frames yourself.`,
+        error: "Vision services are temporarily overloaded. Wait a minute and try a shorter Look, or name frames yourself.",
       };
-    } catch (error) {
-      console.error(
-        "Gemini recording analysis failed",
-        error instanceof Error ? error.message : "unknown",
-      );
-      return { ok: false, error: "Couldn't reach Gemini. Check your connection and try again." };
     }
+    if (lastStatus === 429) {
+      return {
+        ok: false,
+        error: "Vision rate limit reached. Wait a little and try again, or name frames yourself.",
+      };
+    }
+    if (!openRouterKey && (lastStatus === 503 || lastStatus === 429 || lastStatus === 0)) {
+      return {
+        ok: false,
+        error: "Gemini is unavailable right now. Add OPENROUTER_API_KEY for a free fallback, or name frames yourself.",
+      };
+    }
+
+    return {
+      ok: false,
+      error: `Couldn't analyze this recording (${lastStatus || "error"}). You can name the frames yourself.`,
+    };
   });
