@@ -247,18 +247,30 @@ async function getVideoDuration(
     Number.isFinite(video.duration) &&
     video.duration > 0
   ) {
-    return video.duration;
+    duration = video.duration;
+  } else {
+    duration = getSeekableEnd();
   }
 
-  duration = getSeekableEnd();
-
-  if (duration > 0) {
-    return duration;
+  if (!(duration > 0)) {
+    throw new Error(
+      "Couldn't determine the recording length. Please try recording again.",
+    );
   }
 
-  throw new Error(
-    "Couldn't determine the recording length. Please try recording again.",
-  );
+  // Reset to the start so later frame seeks are reliable after the
+  // Infinity-recovery seek left the playhead at the end.
+  try {
+    if (video.currentTime > 0.05) {
+      const seeked = waitForMediaEvent(video, "seeked", 5000);
+      video.currentTime = 0;
+      await seeked;
+    }
+  } catch {
+    // Frame extraction will still attempt individual seeks.
+  }
+
+  return duration;
 }
 
 /**
@@ -312,20 +324,25 @@ export async function extractFramesFromVideo(
       );
     }
 
+    // Sample more densely on short clips so stopping early still yields
+    // enough frames for object identification.
     const count = Math.max(
       1,
       Math.min(
         maxFrames,
         MAX_ANALYSIS_FRAMES,
-        Math.ceil(duration / 3),
+        duration < 3
+          ? Math.max(1, Math.ceil(duration * 2))
+          : Math.ceil(duration / 2.5),
       ),
     );
 
-    const firstTime = Math.min(0.1, duration / 2);
-
+    // Avoid the absolute start/end of MediaRecorder WebM where keyframes
+    // are sometimes missing or black.
+    const firstTime = Math.min(0.15, Math.max(0, duration * 0.05));
     const lastTime = Math.max(
       firstTime,
-      duration - Math.min(0.1, duration / 2),
+      duration - Math.min(0.2, duration * 0.08),
     );
 
     const output: ExtractedVideoFrame[] = [];
@@ -350,6 +367,11 @@ export async function extractFramesFromVideo(
         await seeked;
       }
 
+      // Brief settle so the decoded frame is painted before capture.
+      await new Promise((resolve) => {
+        requestAnimationFrame(() => resolve(undefined));
+      });
+
       // Capture the high-quality photograph.
       const photoBlob = await drawToJpeg(
         video,
@@ -371,6 +393,12 @@ export async function extractFramesFromVideo(
       });
     }
 
+    if (!output.length) {
+      throw new Error(
+        "No frames could be captured from that recording. Please try again.",
+      );
+    }
+
     return output;
   } finally {
     video.pause();
@@ -380,3 +408,4 @@ export async function extractFramesFromVideo(
     URL.revokeObjectURL(url);
   }
 }
+
